@@ -1,10 +1,12 @@
 #include "rpc.h"
 #include <stdio.h>
 
-static int echo(const rpc_buf *req, rpc_buf *resp, void *user)
+static int echo(rpc_request *req, void *user)
 {
     (void)user;
-    return rpc_buf_append(resp, req->data, req->len);
+    return rpc_request_set_response(req, rpc_request_data(req),
+                                    rpc_request_size(req)) == RPC_OK
+               ? RPC_DONE : RPC_ERR_NOMEM;
 }
 
 int main(void)

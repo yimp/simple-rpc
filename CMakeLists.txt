@@ -1,19 +1,23 @@
 cmake_minimum_required(VERSION 3.16)
-project(simple_rpc VERSION 0.1.0 LANGUAGES C)
+project(simple_rpc VERSION 0.2.0 LANGUAGES C)
+
+find_package(Threads REQUIRED)
 
 add_library(simple_rpc STATIC src/rpc.c)
+target_link_libraries(simple_rpc PUBLIC Threads::Threads)
 target_include_directories(simple_rpc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(simple_rpc PUBLIC c_std_11)
 target_compile_options(simple_rpc PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(echo_server examples/echo_server.c)
 target_link_libraries(echo_server PRIVATE simple_rpc)
+add_executable(async_server examples/async_server.c)
+target_link_libraries(async_server PRIVATE simple_rpc)
 add_executable(echo_client examples/echo_client.c)
 target_link_libraries(echo_client PRIVATE simple_rpc)
 
 include(CTest)
 if(BUILD_TESTING)
-    find_package(Threads REQUIRED)
     add_executable(rpc_tests tests/test_rpc.c)
     target_link_libraries(rpc_tests PRIVATE simple_rpc Threads::Threads)
     add_test(NAME rpc_integration COMMAND rpc_tests)

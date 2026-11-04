@@ -38,13 +38,39 @@ typedef struct rpc_buf {
 
 typedef struct rpc_server rpc_server;
 typedef struct rpc_client rpc_client;
+typedef struct rpc_request rpc_request;
 
-/* Handlers run on the server's event-loop thread: keep them short and nonblocking.
- * A zero return means success; any other return produces HANDLER_ERROR.
- * Request memory is valid only during the callback.
+/* A handler is invoked on the Reactor thread. It must not block.
+ * RPC_DONE: the framework sends the response set by rpc_request_set_response().
+ * RPC_PENDING: the application MUST call rpc_request_reply() exactly once, even
+ * when the peer has disconnected or the server has been stopped.
+ * Any other return value produces RPC_STATUS_HANDLER_ERROR.
+ *
+ * For RPC_PENDING, the framework keeps req and its request bytes alive until
+ * reply() has copied the result. No retain/release is needed or exposed.
+ * Do not access req after a successful reply(), including from other tasks;
+ * coordinate those tasks before replying. If reply() fails with NOMEM, the
+ * caller still owns the pending completion obligation and may retry.
+ * An asynchronous reply may race with the return of the handler itself.
  */
-typedef int (*rpc_handler)(const rpc_buf *request, rpc_buf *response,
-                           void *userdata);
+enum { RPC_DONE = 0, RPC_PENDING = 1 };
+typedef int (*rpc_handler)(rpc_request *req, void *userdata);
+
+/* Request bytes are read-only and owned by the framework. The pointer remains
+ * valid until the handler returns RPC_DONE or a pending request is replied to.
+ */
+uint32_t rpc_request_method(const rpc_request *req);
+const void *rpc_request_data(const rpc_request *req);
+size_t rpc_request_size(const rpc_request *req);
+
+/* Only call from the handler before returning RPC_DONE; copies the payload. */
+int rpc_request_set_response(rpc_request *req, const void *data, size_t size);
+/* Thread-safe completion for pending requests. Copies data before returning;
+ * an RPC_OK return consumes req. Does not guarantee delivery to the peer.
+ * The server event loop owns the socket and sends or discards the reply.
+ */
+int rpc_request_reply(rpc_request *req, uint32_t status,
+                      const void *data, size_t size);
 
 int rpc_buf_append(rpc_buf *buf, const void *data, size_t len);
 void rpc_buf_free(rpc_buf *buf);
@@ -57,11 +83,16 @@ int rpc_server_register(rpc_server *server, uint32_t method,
 /* IPv4 bind address, e.g. "127.0.0.1" or "0.0.0.0"; 0 chooses a free port. */
 int rpc_server_listen(rpc_server *server, const char *host, uint16_t port);
 uint16_t rpc_server_port(const rpc_server *server);
-/* Blocks until rpc_server_stop(); handles multiple client connections. */
+/* Blocks until rpc_server_stop() AND all pending handlers have replied.
+ * Stop closes client connections and discards late replies, but cannot cancel
+ * user tasks. A missing reply can therefore prevent shutdown indefinitely.
+ */
 int rpc_server_run(rpc_server *server);
 /* Thread-safe while the server exists; wakes a blocked event loop. */
 void rpc_server_stop(rpc_server *server);
-/* Call after rpc_server_run() returns, never concurrently with run/stop. */
+/* Call after rpc_server_run() returns, never concurrently with run/stop.
+ * External worker pools must not access any request or server after destroy.
+ */
 void rpc_server_destroy(rpc_server *server);
 
 /* Connect using IPv4 or hostname; timeout_ms must be positive. DNS resolution

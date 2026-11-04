@@ -6,6 +6,8 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -127,6 +129,7 @@ typedef struct rpc_conn {
     int fd;
     struct rpc_server *server;
     struct rpc_conn *next;
+    int closed;
     uint8_t header[RPC_HEADER_SIZE];
     size_t header_read;
     uint8_t *payload;
@@ -134,10 +137,25 @@ typedef struct rpc_conn {
     size_t payload_read;
     uint32_t request_id;
     uint32_t method;
+    struct rpc_request *active;
     uint8_t *out;
     size_t out_len;
     size_t out_written;
 } rpc_conn;
+
+struct rpc_request {
+    struct rpc_server *server;
+    rpc_conn *conn;                   /* Reactor thread only; NULL if closed. */
+    uint32_t request_id;
+    uint32_t method;
+    uint8_t *data;
+    size_t size;
+    rpc_buf response;                /* Handler thread (Reactor) only. */
+    atomic_bool replied;             /* Prevent competing completions. */
+    uint8_t *reply_frame;            /* Published through completion_lock. */
+    size_t reply_len;
+    struct rpc_request *completed_next;
+};
 
 struct rpc_server {
     int listen_fd;
@@ -146,9 +164,86 @@ struct rpc_server {
     uint16_t port;
     method_entry *methods;
     rpc_conn *connections;
+    rpc_conn *closed_connections;     /* Deferred until epoll batch finishes. */
+    pthread_mutex_t completion_lock;
+    rpc_request *completed_head;
+    rpc_request *completed_tail;
+    size_t pending_count;            /* Reactor thread only. */
     atomic_bool stopping;
     atomic_bool running;
 };
+
+uint32_t rpc_request_method(const rpc_request *req)
+{
+    return req ? req->method : 0;
+}
+
+const void *rpc_request_data(const rpc_request *req)
+{
+    return req ? req->data : NULL;
+}
+
+size_t rpc_request_size(const rpc_request *req)
+{
+    return req ? req->size : 0;
+}
+
+int rpc_request_set_response(rpc_request *req, const void *data, size_t size)
+{
+    if (!req || (size && !data)) return RPC_ERR_INVALID;
+    if (size > RPC_MAX_PAYLOAD) return RPC_ERR_LIMIT;
+    /* This function is only called by the synchronous handler. */
+    req->response.len = 0;
+    return rpc_buf_append(&req->response, data, size);
+}
+
+static uint8_t *encode_reply(uint32_t request_id, uint32_t method,
+                             uint32_t status, const void *data, size_t len)
+{
+    uint8_t *frame = malloc(RPC_HEADER_SIZE + len);
+    if (!frame) return NULL;
+    make_header(frame, RPC_RESPONSE, request_id, method, status, (uint32_t)len);
+    if (len) memcpy(frame + RPC_HEADER_SIZE, data, len);
+    return frame;
+}
+
+int rpc_request_reply(rpc_request *req, uint32_t status,
+                      const void *data, size_t size)
+{
+    if (!req || (size && !data)) return RPC_ERR_INVALID;
+    if (size > RPC_MAX_PAYLOAD) return RPC_ERR_LIMIT;
+    uint8_t *frame = encode_reply(req->request_id, req->method,
+                                  status, data, size);
+    if (!frame) return RPC_ERR_NOMEM;
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&req->replied, &expected, true)) {
+        free(frame);
+        return RPC_ERR_INVALID;
+    }
+    /* Publish the completed frame. Only the Reactor reads this queue. */
+    req->reply_frame = frame;
+    req->reply_len = RPC_HEADER_SIZE + size;
+    rpc_server *s = req->server;
+    pthread_mutex_lock(&s->completion_lock);
+    if (s->completed_tail) s->completed_tail->completed_next = req;
+    else s->completed_head = req;
+    s->completed_tail = req;
+    /* Keep the server alive until the wakeup is posted: shutdown drains the
+     * queue under this mutex before releasing its own resources. */
+    uint64_t one = 1;
+    (void)write(s->wake_fd, &one, sizeof(one));
+    pthread_mutex_unlock(&s->completion_lock);
+    return RPC_OK;
+}
+
+static void free_request(rpc_request *req)
+{
+    if (!req) return;
+    free(req->data);
+    rpc_buf_free(&req->response);
+    free(req->reply_frame);
+    free(req);
+}
 
 rpc_server *rpc_server_create(void)
 {
@@ -161,8 +256,13 @@ rpc_server *rpc_server_create(void)
         free(s);
         return NULL;
     }
-    atomic_init(&s->stopping, 0);
-    atomic_init(&s->running, 0);
+    if (pthread_mutex_init(&s->completion_lock, NULL) != 0) {
+        close(s->wake_fd);
+        free(s);
+        return NULL;
+    }
+    atomic_init(&s->stopping, false);
+    atomic_init(&s->running, false);
     return s;
 }
 
@@ -214,14 +314,30 @@ uint16_t rpc_server_port(const rpc_server *s)
 
 static void close_conn(rpc_server *s, rpc_conn *c)
 {
+    if (c->closed) return;
+    c->closed = 1;
     rpc_conn **p = &s->connections;
     while (*p && *p != c) p = &(*p)->next;
     if (*p) *p = c->next;
     if (s->epoll_fd >= 0) epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
+    if (c->active) {
+        c->active->conn = NULL;   /* Pending request stays alive until reply. */
+        c->active = NULL;
+    }
     free(c->payload);
     free(c->out);
-    free(c);
+    c->next = s->closed_connections;
+    s->closed_connections = c;
+}
+
+static void reap_closed(rpc_server *s)
+{
+    while (s->closed_connections) {
+        rpc_conn *c = s->closed_connections;
+        s->closed_connections = c->next;
+        free(c);
+    }
 }
 
 static int conn_events(rpc_conn *c, uint32_t flags)
@@ -230,38 +346,55 @@ static int conn_events(rpc_conn *c, uint32_t flags)
     return epoll_ctl(c->server->epoll_fd, EPOLL_CTL_MOD, c->fd, &ev);
 }
 
+/* Transfers ownership of frame to the connection. Reactor thread only. */
+static int send_response(rpc_conn *c, uint8_t *frame, size_t len)
+{
+    c->out = frame;
+    c->out_len = len;
+    c->out_written = 0;
+    return conn_events(c, EPOLLOUT);
+}
+
 static int dispatch(rpc_conn *c)
 {
     rpc_server *s = c->server;
-    rpc_buf req = {.data = c->payload, .len = c->payload_len};
-    rpc_buf response = {0};
-    uint32_t status = RPC_STATUS_NO_METHOD;
-    for (method_entry *e = s->methods; e; e = e->next) {
-        if (e->method == c->method) {
-            status = e->fn(&req, &response, e->userdata) == RPC_OK
-                         ? RPC_STATUS_OK : RPC_STATUS_HANDLER_ERROR;
-            break;
-        }
-    }
-    if (response.len > RPC_MAX_PAYLOAD) status = RPC_STATUS_TOO_LARGE;
-    if (status != RPC_STATUS_OK) response.len = 0;
-    c->out_len = RPC_HEADER_SIZE + response.len;
-    c->out = malloc(c->out_len);
-    if (!c->out) {
-        rpc_buf_free(&response);
-        return -1;
-    }
-    make_header(c->out, RPC_RESPONSE, c->request_id, c->method,
-                status, (uint32_t)response.len);
-    if (response.len)
-        memcpy(c->out + RPC_HEADER_SIZE, response.data, response.len);
-    rpc_buf_free(&response);
-    free(c->payload);
+    rpc_request *req = calloc(1, sizeof(*req));
+    if (!req) return -1;
+    req->server = s;
+    req->conn = c;
+    req->request_id = c->request_id;
+    req->method = c->method;
+    req->data = c->payload;
+    req->size = c->payload_len;
+    atomic_init(&req->replied, false);
     c->payload = NULL;
     c->payload_len = 0;
     c->payload_read = 0;
     c->header_read = 0;
-    return conn_events(c, EPOLLOUT);
+    c->active = req;
+
+    method_entry *entry = NULL;
+    for (method_entry *e = s->methods; e; e = e->next) {
+        if (e->method == req->method) {
+            entry = e;
+            break;
+        }
+    }
+    int result = entry ? entry->fn(req, entry->userdata) : RPC_DONE;
+    if (result == RPC_PENDING || atomic_load(&req->replied)) {
+        /* The reply may already be queued before the handler has returned. */
+        ++s->pending_count;
+        return conn_events(c, 0); /* No EPOLLIN until the reply is sent. */
+    }
+    uint32_t status = !entry ? RPC_STATUS_NO_METHOD :
+                      result == RPC_DONE ? RPC_STATUS_OK : RPC_STATUS_HANDLER_ERROR;
+    size_t size = status == RPC_STATUS_OK ? req->response.len : 0;
+    uint8_t *frame = encode_reply(req->request_id, req->method, status,
+                                  req->response.data, size);
+    c->active = NULL;
+    free_request(req);
+    if (!frame) return -1;
+    return send_response(c, frame, RPC_HEADER_SIZE + size);
 }
 
 static int conn_read(rpc_conn *c)
@@ -317,6 +450,33 @@ static int conn_write(rpc_conn *c)
     return conn_events(c, EPOLLIN);
 }
 
+/* Called on the Reactor thread; async reply() never accesses a connection. */
+static void drain_completions(rpc_server *s, int deliver)
+{
+    pthread_mutex_lock(&s->completion_lock);
+    rpc_request *list = s->completed_head;
+    s->completed_head = s->completed_tail = NULL;
+    pthread_mutex_unlock(&s->completion_lock);
+    while (list) {
+        rpc_request *req = list;
+        list = req->completed_next;
+        rpc_conn *c = req->conn;
+        if (deliver && c && !c->closed && c->active == req) {
+            c->active = NULL;
+            req->conn = NULL;
+            uint8_t *frame = req->reply_frame;
+            size_t len = req->reply_len;
+            req->reply_frame = NULL;
+            if (send_response(c, frame, len) < 0) close_conn(s, c);
+        } else if (c && c->active == req) {
+            c->active = NULL;
+            req->conn = NULL;
+        }
+        free_request(req);
+        --s->pending_count;
+    }
+}
+
 static int accept_clients(rpc_server *s)
 {
     for (;;) {
@@ -347,11 +507,17 @@ static int accept_clients(rpc_server *s)
     }
 }
 
+static void read_wakeup(rpc_server *s)
+{
+    uint64_t value;
+    while (read(s->wake_fd, &value, sizeof(value)) > 0) {}
+}
+
 int rpc_server_run(rpc_server *s)
 {
-    if (!s || s->listen_fd < 0 || atomic_exchange(&s->running, 1))
+    if (!s || s->listen_fd < 0 || atomic_exchange(&s->running, true))
         return RPC_ERR_INVALID;
-    atomic_store(&s->stopping, 0);
+    atomic_store(&s->stopping, false);
     int result = RPC_OK;
     s->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (s->epoll_fd < 0) result = RPC_ERR_IO;
@@ -364,43 +530,68 @@ int rpc_server_run(rpc_server *s)
                                          s->wake_fd, &ev) < 0)
             result = RPC_ERR_IO;
     }
-    while (result == RPC_OK && !atomic_load(&s->stopping)) {
+    int shutting_down = 0;
+    for (;;) {
+        if ((result != RPC_OK || atomic_load(&s->stopping)) && !shutting_down) {
+            shutting_down = 1;
+            if (s->epoll_fd >= 0)
+                epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, s->listen_fd, NULL);
+            while (s->connections) close_conn(s, s->connections);
+        }
+        drain_completions(s, !shutting_down);
+        reap_closed(s);
+        if (shutting_down && s->pending_count == 0) break;
+
+        if (result != RPC_OK) {
+            /* epoll failed; still wait for outstanding user tasks to reply. */
+            struct pollfd pfd = {.fd = s->wake_fd, .events = POLLIN};
+            int n = poll(&pfd, 1, -1);
+            if (n > 0) read_wakeup(s);
+            else if (n < 0 && errno != EINTR) break;
+            continue;
+        }
         struct epoll_event events[RPC_MAX_EVENTS];
         int count = epoll_wait(s->epoll_fd, events, RPC_MAX_EVENTS, -1);
         if (count < 0) {
             if (errno == EINTR) continue;
             result = RPC_ERR_IO;
-            break;
+            continue;
         }
-        for (int i = 0; i < count && !atomic_load(&s->stopping); ++i) {
+        for (int i = 0; i < count; ++i) {
+            if (atomic_load(&s->stopping)) break;
             if (events[i].data.ptr == NULL) {
                 if (accept_clients(s) < 0) result = RPC_ERR_IO;
             } else if (events[i].data.ptr == s) {
-                uint64_t value;
-                while (read(s->wake_fd, &value, sizeof(value)) > 0) {}
+                read_wakeup(s);
+                drain_completions(s, 1);
             } else {
                 rpc_conn *c = events[i].data.ptr;
+                if (c->closed) continue; /* Stale event in current batch. */
                 uint32_t flags = events[i].events;
                 int rc = 0;
                 if (flags & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) rc = -1;
                 else if (c->out && (flags & EPOLLOUT)) rc = conn_write(c);
-                else if (!c->out && (flags & EPOLLIN)) rc = conn_read(c);
+                else if (!c->out && !c->active && (flags & EPOLLIN))
+                    rc = conn_read(c);
                 if (rc < 0) close_conn(s, c);
             }
             if (result != RPC_OK) break;
         }
+        reap_closed(s);
     }
-    while (s->connections) close_conn(s, s->connections);
+    read_wakeup(s);
+    drain_completions(s, 0);
+    reap_closed(s);
     if (s->epoll_fd >= 0) close(s->epoll_fd);
     s->epoll_fd = -1;
-    atomic_store(&s->running, 0);
+    atomic_store(&s->running, false);
     return result;
 }
 
 void rpc_server_stop(rpc_server *s)
 {
     if (!s) return;
-    atomic_store(&s->stopping, 1);
+    atomic_store(&s->stopping, true);
     uint64_t one = 1;
     (void)write(s->wake_fd, &one, sizeof(one));
 }
@@ -409,6 +600,7 @@ void rpc_server_destroy(rpc_server *s)
 {
     if (!s) return;
     while (s->connections) close_conn(s, s->connections);
+    reap_closed(s);
     method_entry *e = s->methods;
     while (e) {
         method_entry *next = e->next;
@@ -418,6 +610,7 @@ void rpc_server_destroy(rpc_server *s)
     if (s->epoll_fd >= 0) close(s->epoll_fd);
     if (s->listen_fd >= 0) close(s->listen_fd);
     close(s->wake_fd);
+    pthread_mutex_destroy(&s->completion_lock);
     free(s);
 }
 
