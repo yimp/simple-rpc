@@ -1,124 +1,153 @@
 # simple-rpc
 
-一个刻意保持简单的 **Linux / C11** TCP RPC 框架，适合作为理解和扩展 RPC 的起点。没有第三方运行时依赖。
+用于学习与实验的 **Linux / C11** 轻量 TCP RPC 框架，只有 libc、pthread 等系统依赖。当前版本 **v0.3.0**。
 
-## 设计
+支持普通 Unary（单请求 / 单响应）和两种流式 RPC：**Server Streaming**（一次请求、多条响应消息）、**Client Streaming**（多条请求消息、最多一条响应消息）。不同于完整的 gRPC，本项目不使用 protobuf / HTTP/2。
 
-- **服务端**：非阻塞 Socket + `epoll`（LT 模式），单 Reactor 线程管理多个连接。
-- **客户端**：同步 `rpc_call()`；底层非阻塞 Socket + `poll()`，控制单次调用的总超时。
-- **业务执行**：统一的 `rpc_handler(rpc_request *, void *)`。返回 `RPC_DONE` 则框架立即应答；返回 `RPC_PENDING` 则交给业务稍后调用 `rpc_request_reply()`。
-- **外部线程池**：框架不创建 Worker，也不要求用户 `retain/release`。用户可以将 `rpc_request *` 放入已有线程池或异步事件系统；后台线程调用 `reply()`，框架通过线程安全完成队列和 `eventfd` 唤醒 Reactor。
-- **连接模型**：长连接复用、多连接并发；每个连接只处理一个未完成请求，不支持单连接多路复用。
-- **协议**：固定 24 字节包头 + Payload，网络字节序，单帧最大 Payload 1 MiB；字段显式编解码。
-- **安全边界**：这是受信任环境内的学习型实现，**不支持 TLS、认证、限流和生产级资源配额**；不要直接暴露到公网。
+> **实验性项目：** 不提供 TLS、认证、生产级限流和资源配额。不要直接暴露至不受信任网络，也不要作为未经审计的生产级备份数据通道。
 
-## 编译及运行
+## 设计概要
 
-要求 Linux、CMake >= 3.16、C11 编译器、pthread。
+- **服务端**：非阻塞 Socket + 单线程 `epoll` LT Reactor。Handler 在 Reactor 中进入，耗时逻辑交给用户 Worker，返回 `RPC_PENDING`。
+- **客户端**：同步 API；底层非阻塞 Socket + `poll()`，各次读、写独立设置超时。
+- **连接**：长连接复用，但**一条 TCP 连接同时只能执行一个 RPC（Unary 或 Stream）**；不支持多路复用，不支持同一个 `rpc_client *` 的并发操作。
+- **协议**：24 字节二进制帧头，网络字节序。单条消息最多 **1 MiB**，**整条流的数据总量不受该限制**。
+- **Stream**：不透明 `rpc_stream`，显式结束发送、服务端完成与客户端销毁。成功写入只表示数据已交给框架，不保证对端已收到。
+- **背压**：服务端每条流最多缓存 **2 条待发送消息**（包含当前正在 Socket 上发送的消息）；接收侧最多排队 2 条消息，额外允许一条正在解析的消息。队列满时 Worker 等待、Reactor 适时暂停读。背压不会阻塞 Reactor。
+- **异步生命周期**：业务不需要引用计数。异步 Handler 返回 `RPC_PENDING` 后，必须最终执行成功的 `reply()` 或 `stream_finish()`，即使客户端已断开。服务端停止等待未完成业务；业务忘记完成会造成无限等待。
 
-```bash
+## 编译和测试
+
+要求 Linux、C11 编译器、CMake >= 3.16、pthread。
+
+```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-同步 Echo 演示：
+测试包含 Unary 兼容、流的分帧及重组（超过单帧上限）、并行连接、正常与失败终止、Worker 提前完成、缓冲区背压、断连和服务端停止。`tests/test_stream.c` 包含更完整的流式案例。
 
-```bash
-# 终端 1
-./build/echo_server
-# 终端 2
-./build/echo_client
+同步 Unary 演示：两个终端运行 `./build/echo_server` 与 `./build/echo_client`。
+
+流式演示：两个终端运行 `./build/stream_server` 与 `./build/stream_client`，输出示例：
+
+```text
+download: 3145728 bytes
+upload: 3145728 bytes
 ```
 
-异步服务端演示：`./build/async_server`（监听 `127.0.0.1:9001`，展示业务自有 Worker）；客户端示例连接 `9000`，可按需修改。
+`examples/stream_server.c` 演示使用业务自有的工作线程处理流式请求。示例为演示性质，实际使用时仍需要有界的 Worker 任务队列。
 
-## API：同步 Handler
-
-`rpc_request` 是**不透明对象**：用户不能修改其内部状态，也不需要参与引用计数。
+## 1. Unary（已有接口，兼容 v0.2）
 
 ```c
-int echo_handler(rpc_request *req, void *userdata)
+int echo(rpc_request *req, void *ud)
 {
-    (void)userdata;
     int rc = rpc_request_set_response(
         req, rpc_request_data(req), rpc_request_size(req));
     return rc == RPC_OK ? RPC_DONE : rc;
 }
 
-rpc_server *s = rpc_server_create();
-rpc_server_register(s, 1, echo_handler, NULL);
-rpc_server_listen(s, "127.0.0.1", 9000);
-rpc_server_run(s);       /* 阻塞运行，直到 stop 且待处理请求完成 */
-rpc_server_destroy(s);
+rpc_server_register(server, METHOD_ECHO, echo, NULL);
+
+rpc_buf result = {0};
+int rc = rpc_call(client, METHOD_ECHO, data, size, &result, 3000);
+rpc_buf_free(&result);
 ```
 
-同步 Handler **在 Reactor 线程执行，不能长时间阻塞**。`rpc_request_set_response()` 会复制字节；Handler 返回 `RPC_DONE` 后框架发送响应。返回其他负值时发送 `RPC_STATUS_HANDLER_ERROR`。
+耗时 Handler 可返回 `RPC_PENDING`，由业务 Worker 调用 `rpc_request_reply()` 完成；`rpc_request` 不透明，业务无需调用 `retain/release`。
 
-## API：异步 Handler
+## 2. Server Streaming（备份读取、元数据扫描）
+
+中心端作为 **RPC Client** 发起一个读取请求，源端 Agent 作为 **RPC Server** 持续发送数据消息：
 
 ```c
-int async_handler(rpc_request *req, void *userdata)
-{
-    my_pool *pool = userdata;
-    if (my_pool_submit(pool, worker_task, req) != 0)
-        return RPC_ERR_IO;   /* 任务没有接管 req，框架回复错误 */
-    return RPC_PENDING;     /* 此后业务负责最终调用一次 reply */
-}
+/* 注册时选择服务端流式模式，Handler 必须快速返回。 */
+rpc_server_register_stream(server, METHOD_READ, RPC_STREAM_SERVER,
+                           read_handler, worker_pool);
 
-void worker_task(void *arg)
-{
-    rpc_request *req = arg;
-    const void *data = rpc_request_data(req);
-    size_t size = rpc_request_size(req);
-
-    int rc = rpc_request_reply(req, RPC_STATUS_OK, data, size);
-    /* rc == RPC_OK 后，不能再访问 req，其他任务也不能访问。 */
-    /* rc == RPC_ERR_NOMEM 时，业务必须重试或采取其他完成措施。 */
+/* 客户端打开并连续读取完整消息。 */
+rpc_stream *stream = NULL;
+int rc = rpc_stream_open(client, METHOD_READ, RPC_STREAM_SERVER,
+                         &range, sizeof(range), 5000, &stream);
+if (rc == RPC_OK) {
+    rpc_buf msg = {0};
+    while ((rc = rpc_stream_read(stream, &msg, 5000)) == RPC_OK) {
+        consume(msg.data, msg.len);
+    }
+    /* RPC_STREAM_EOF: 正常结束；RPC_ERR_REMOTE: 远端返回失败状态。 */
+    rpc_buf_free(&msg);
+    rpc_stream_destroy(stream);
 }
 ```
 
-**异步完成契约**：
+服务端 Handler 应将 `rpc_stream *` 交给业务线程，返回 `RPC_PENDING`。业务线程可反复调用 `rpc_stream_write()`，最后调用 **一次** `rpc_stream_finish(stream, status)`。成功 finish 之后业务不得再访问 stream。
 
-- `RPC_PENDING` 表示业务承担请求完成责任：**最终必须调用一次成功的 `rpc_request_reply()`**，不论客户端是否断开。
-- `reply()` 可从任意 Worker 线程调用，也允许在 Handler 返回 `RPC_PENDING` 之前完成。`reply()` 复制响应字节并将结果排入完成队列；Socket 发送仍由 Reactor 执行。
-- `reply()` 返回 `RPC_OK` 表示结果已交给框架，不代表对端收到；之后 `req` 不再属于业务。若返回 `RPC_ERR_NOMEM` 或输入无效，请求仍未完成，业务须修复或重试。
-- 如果一个请求被多个任务访问，业务必须先自行汇合所有任务再 `reply()`，避免其他任务继续使用已完成的请求。
-- 连接断开仅关闭 Socket，**不能释放业务仍在使用的异步请求**。当 Worker 最终 `reply()` 时，框架会丢弃不可投递的响应并回收请求。
-- `rpc_server_stop()` 使 Reactor 关闭连接并等待所有已接管的 `RPC_PENDING` 请求完成，之后 `rpc_server_run()` 才返回。**漏调用 `reply()` 会导致停止无限等待**；框架无法从运行时间推断业务是否结束。
-- `rpc_server_destroy()` 只能在 `rpc_server_run()` 返回后调用。若使用自有 Worker Pool，必须保证停止时不会再访问框架资源；可以先 join 工作线程再销毁 RPC 服务端。
+`rpc_stream_write()` 提交的是一条具有消息边界的记录，**不是** POSIX 的可能部分写入的 `write()`；超过 1 MiB 的逻辑业务数据需拆成多条消息。
 
-## 客户端
+## 3. Client Streaming（数据恢复、持续上传）
+
+中心端发起恢复任务并连续发送数据，Agent 持续读取，最后返回完成确认：
 
 ```c
-rpc_client *c = rpc_client_connect("127.0.0.1", 9000, 3000);
-rpc_buf resp = {0};
-int rc = rpc_call(c, 1, "hello", 5, &resp, 3000);
-/* rc == RPC_OK 时使用 resp.data / resp.len */
-rpc_buf_free(&resp);
-rpc_client_close(c);
+rpc_stream *stream = NULL;
+int rc = rpc_stream_open(client, METHOD_RESTORE, RPC_STREAM_CLIENT,
+                         &metadata, sizeof(metadata), 5000, &stream);
+if (rc == RPC_OK) {
+    while ((n = get_next_chunk(buf, sizeof(buf))) > 0) {
+        rc = rpc_stream_write(stream, buf, (size_t)n, 5000);
+        if (rc != RPC_OK) break;
+    }
+    if (rc == RPC_OK) rc = rpc_stream_finish_send(stream, 5000);
+    if (rc == RPC_OK) {
+        rpc_buf result = {0};
+        rc = rpc_stream_read(stream, &result, 5000);
+        /* 接收最终业务消息（如有），并继续读取直到 EOF / REMOTE。 */
+        rpc_buf_free(&result);
+    }
+    rpc_stream_destroy(stream);
+}
 ```
 
-客户端不支持在同一个 `rpc_client *` 上并发发起调用。`RPC_ERR_REMOTE` 时可用 `rpc_client_last_status()` 查看远端状态。超时或传输故障后连接关闭；**超时不代表远端业务一定没有执行**。
+服务端的业务 Worker 调用 `rpc_stream_read()` 获取请求消息；收到 `RPC_STREAM_EOF` 代表客户端**正常半关闭请求方向**，然后最多写一条结果消息，并调用 `rpc_stream_finish()` 发送最终状态。
 
-## 帧格式（网络字节序）
+### 三种「结束」不能混淆
 
-| 偏移 | 字节数 | 字段 |
-|---:|---:|---|
-| 0 | 4 | Magic，`0x53525043`（`SRPC`） |
-| 4 | 2 | Version = 1 |
-| 6 | 2 | Type：1 请求，2 响应 |
-| 8 | 4 | Request ID |
-| 12 | 4 | Method ID |
-| 16 | 4 | Status（请求必须为 0） |
-| 20 | 4 | Payload Length，0～1 MiB |
-| 24 | N | 业务 Payload，原样字节，不限定编码 |
+| API | 调用方 | 含义 |
+|---|---|---|
+| `rpc_stream_finish_send()` | Client Streaming 的客户端 | 请求数据已经发送完，**继续等响应** |
+| `rpc_stream_finish()` | 服务端 Worker | 本次 RPC 的最终业务状态；成功后业务不再使用 Stream |
+| `rpc_stream_destroy()` | 客户端 | 释放句柄；未完成的调用通过**关闭连接**取消 |
 
-客户端使用递增 Request ID；服务端响应回显 Request ID 与 Method ID。未知 Method 返回 `RPC_STATUS_NO_METHOD`。超过帧长上限的**入站帧**将导致连接断开。
+读取返回值：`RPC_OK` 表示收到一条完整消息（允许空消息）；`RPC_STREAM_EOF` 表示成功的消息序列结束；`RPC_ERR_REMOTE` 表示最终状态非 `RPC_STATUS_OK`；`RPC_ERR_TIMEOUT`、`RPC_ERR_CLOSED`、`RPC_ERR_PROTOCOL` 表示传输问题。`rpc_stream_remote_status()` 可在 EOF / REMOTE 后读取最终业务状态。
 
-## 当前边界
+**注意：** 每次 `rpc_stream_read/write` 的 timeout 是该次操作的期限，而不是整个备份任务的统一期限。超时后的业务取消、重试、偏移检查点等应由调用方设计。
 
-- 无内置线程池或自动 Executor：用户自行负责 Worker 调度、任务队列容量及背压。异步 Handler 的任务提交过程本身不能阻塞 Reactor。
-- 无同连接多路复用：每个连接一次只处理一个 RPC。异步请求执行期间暂停该连接的新请求读取，最终回复发送后恢复读取。
-- 无框架级请求取消和处理超时：长时间不 `reply()` 的请求会保持占用资源，且会阻止服务端正常停止。调用者应自己监控、限制和处理异常业务任务。
-- 无流式 RPC、自动重试、TLS、身份认证。请勿直接用于不受信任的网络环境。
+## Stream 协议简述
+
+流式扩展保留 v1 的 24 字节帧头格式和旧 Unary 帧：
+
+| 帧 Type | 方向 | 用途 |
+|---|---|---|
+| 1 `REQUEST` / 2 `RESPONSE` | Unary | 保持原有行为 |
+| 3 `STREAM_OPEN` | Client → Server | 发起调用，Header `Status` 存储 Stream 模式，Payload 为初始请求 |
+| 4 `STREAM_DATA` | 双向（受模式约束） | 一条完整数据消息，`Status=0` |
+| 5 `STREAM_HALF_CLOSE` | Client → Server | Client Streaming 的请求发送完成，Payload 为空 |
+| 6 `STREAM_FINISH` | Server → Client | RPC 最终状态在 `Status` 字段，Payload 为空 |
+
+所有流帧都使用相同 Request ID、Method ID，单条 Payload 最多 1 MiB；当前连接不混用多个在途 Stream。Server Streaming 的请求方向在 `STREAM_OPEN` 后**隐式结束**。
+
+细节、约束、状态机见 [docs/streaming.md](docs/streaming.md)。
+
+## v0.3 边界与下一步
+
+- 只支持 **Server Streaming** 和 **Client Streaming**；不支持双向流、一连接多路复用。
+- Client Stream 由调用线程顺序操作；同一 Stream 也只允许**一个业务线程**执行 `read/write/finish`，并发访问必须自行串行化。
+- Server Streaming 业务 Worker 的写、Client Streaming 业务 Worker 的读允许阻塞；**Reactor 线程严禁执行这些可能等待的操作**。
+- 服务端独立设置的**应用层流队列**是有界的，但没有全局内存预算、连接总量或任务数限制；客户端阻塞发送依赖 TCP 背压。
+- 取消暂时通过关闭 TCP 连接实现；没有单流取消帧、应用层 deadline 传播、自动重试或断点续传。
+- 协议未提供版本能力协商；v0.2 服务端无法理解新 Stream 帧。Unary 帧保持兼容。
+- `stream_finish()` 的成功只表示交还框架并排队最终状态，不保证对端收到；中途断连不能推断远端业务一定未完成。
+- 停止服务端会唤醒等待 IO 的 Worker，但所有异步业务仍必须明确调用 `finish()`；有业务漏调用会无限等待。
+- 当前重点是功能正确性与可理解性，暂不承诺高连接数下的性能。Worker 唤醒使用 `eventfd`，Reactor 会检查活跃连接，尚未做按连接精准唤醒的优化。

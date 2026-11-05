@@ -108,6 +108,7 @@ const char *rpc_strerror(int error)
     case RPC_ERR_LIMIT: return "payload too large";
     case RPC_ERR_INVALID: return "invalid argument or state";
     case RPC_ERR_NOMEM: return "out of memory";
+    case RPC_STREAM_EOF: return "end of stream";
     default: return "unknown error";
     }
 }
@@ -121,6 +122,8 @@ static int nonblocking(int fd)
 typedef struct method_entry {
     uint32_t method;
     rpc_handler fn;
+    rpc_stream_handler stream_fn;
+    rpc_stream_mode stream_mode;
     void *userdata;
     struct method_entry *next;
 } method_entry;
@@ -138,6 +141,7 @@ typedef struct rpc_conn {
     uint32_t request_id;
     uint32_t method;
     struct rpc_request *active;
+    rpc_stream *stream;
     uint8_t *out;
     size_t out_len;
     size_t out_written;
@@ -172,6 +176,134 @@ struct rpc_server {
     atomic_bool stopping;
     atomic_bool running;
 };
+
+/* Each streaming frame is one complete application message. Reactor alone
+ * accesses TCP sockets; workers coordinate through the stream mutex/cond. */
+#define RPC_STREAM_OPEN 3u
+#define RPC_STREAM_DATA 4u
+#define RPC_STREAM_HALF_CLOSE 5u
+#define RPC_STREAM_FINISH 6u
+#define RPC_STREAM_QUEUE_MESSAGES 2u
+#define RPC_STREAM_QUEUE_BYTES (2u * (RPC_MAX_PAYLOAD + RPC_HEADER_SIZE))
+
+typedef struct stream_frame {
+    uint8_t *bytes;                 /* header+payload for outbound; payload inbound */
+    size_t len;
+    struct stream_frame *next;
+} stream_frame;
+
+struct rpc_stream {
+    rpc_server *server;             /* NULL for a client-side stream */
+    rpc_client *client;             /* Non-NULL for a client-side stream */
+    rpc_conn *conn;                 /* Reactor-owned, never accessed by workers */
+    uint32_t id, method;
+    rpc_stream_mode mode;
+    uint8_t *initial;
+    size_t initial_len;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    stream_frame *in_head, *in_tail;
+    stream_frame *out_head, *out_tail;
+    size_t in_count, in_bytes, out_count, out_bytes;
+    bool remote_closed;            /* Request HALF_CLOSE observed, or server stream */
+    bool local_finished;            /* Final status queued or peer gone */
+    bool failed;                    /* Connection closed; wake blocked workers */
+    bool handler_returned;          /* Prevent worker-finishes-first UAF */
+    bool client_send_closed;
+    bool client_final_received;
+    unsigned client_data_count;
+    uint32_t remote_status;
+    unsigned response_messages;    /* Client streaming allows <= 1 response */
+};
+
+static int64_t clock_ms(void);
+static void stream_free(rpc_stream *st);
+static int server_stream_refresh(rpc_conn *c);
+static int stream_conn_write(rpc_conn *c);
+static int stream_dispatch_open(rpc_conn *c);
+static int stream_consume_frame(rpc_conn *c, uint16_t type);
+static int client_stream_write(rpc_stream *st, const void *data, size_t len, int timeout_ms);
+static int client_stream_read(rpc_stream *st, rpc_buf *message, int timeout_ms);
+
+static void stream_wake(rpc_server *s)
+{
+    uint64_t one = 1;
+    (void)write(s->wake_fd, &one, sizeof(one));
+}
+
+static stream_frame *frame_new(uint16_t type, uint32_t id, uint32_t method,
+                               uint32_t status, const void *data, size_t len)
+{
+    stream_frame *f = calloc(1, sizeof(*f));
+    if (!f) return NULL;
+    f->len = RPC_HEADER_SIZE + len;
+    f->bytes = malloc(f->len);
+    if (!f->bytes) { free(f); return NULL; }
+    make_header(f->bytes, type, id, method, status, (uint32_t)len);
+    if (len) memcpy(f->bytes + RPC_HEADER_SIZE, data, len);
+    return f;
+}
+
+static void frame_free(stream_frame *f)
+{
+    if (!f) return;
+    free(f->bytes);
+    free(f);
+}
+
+static void frame_list_free(stream_frame *f)
+{
+    while (f) {
+        stream_frame *next = f->next;
+        frame_free(f);
+        f = next;
+    }
+}
+
+static int stream_init_server(rpc_stream *st)
+{
+    if (pthread_mutex_init(&st->lock, NULL) != 0) return -1;
+    pthread_condattr_t attr;
+    if (pthread_condattr_init(&attr) != 0) {
+        pthread_mutex_destroy(&st->lock);
+        return -1;
+    }
+    int ok = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0 &&
+             pthread_cond_init(&st->cond, &attr) == 0;
+    pthread_condattr_destroy(&attr);
+    if (!ok) pthread_mutex_destroy(&st->lock);
+    return ok ? 0 : -1;
+}
+
+static void stream_free(rpc_stream *st)
+{
+    if (!st) return;
+    frame_list_free(st->in_head);
+    frame_list_free(st->out_head);
+    free(st->initial);
+    if (st->server) {
+        pthread_cond_destroy(&st->cond);
+        pthread_mutex_destroy(&st->lock);
+    }
+    free(st);
+}
+
+static void stream_fail(rpc_stream *st)
+{
+    pthread_mutex_lock(&st->lock);
+    st->failed = true;
+    pthread_cond_broadcast(&st->cond);
+    pthread_mutex_unlock(&st->lock);
+}
+
+static int stream_wait_until(rpc_stream *st, int64_t deadline)
+{
+    struct timespec ts = {.tv_sec = deadline / 1000,
+                          .tv_nsec = (deadline % 1000) * 1000000L};
+    int rc = pthread_cond_timedwait(&st->cond, &st->lock, &ts);
+    return rc == ETIMEDOUT ? RPC_ERR_TIMEOUT :
+           rc == 0 || rc == EINTR ? RPC_OK : RPC_ERR_IO;
+}
 
 uint32_t rpc_request_method(const rpc_request *req)
 {
@@ -325,6 +457,7 @@ static void close_conn(rpc_server *s, rpc_conn *c)
         c->active->conn = NULL;   /* Pending request stays alive until reply. */
         c->active = NULL;
     }
+    if (c->stream) stream_fail(c->stream);
     free(c->payload);
     free(c->out);
     c->next = s->closed_connections;
@@ -333,9 +466,20 @@ static void close_conn(rpc_server *s, rpc_conn *c)
 
 static void reap_closed(rpc_server *s)
 {
-    while (s->closed_connections) {
-        rpc_conn *c = s->closed_connections;
-        s->closed_connections = c->next;
+    rpc_conn **pp = &s->closed_connections;
+    while (*pp) {
+        rpc_conn *c = *pp;
+        if (c->stream) {
+            rpc_stream *st = c->stream;
+            pthread_mutex_lock(&st->lock);
+            bool done = st->handler_returned && st->local_finished;
+            pthread_mutex_unlock(&st->lock);
+            if (!done) { pp = &c->next; continue; }
+            c->stream = NULL;
+            stream_free(st);
+            --s->pending_count;
+        }
+        *pp = c->next;
         free(c);
     }
 }
@@ -344,6 +488,301 @@ static int conn_events(rpc_conn *c, uint32_t flags)
 {
     struct epoll_event ev = {.events = flags | EPOLLRDHUP, .data.ptr = c};
     return epoll_ctl(c->server->epoll_fd, EPOLL_CTL_MOD, c->fd, &ev);
+}
+
+/* ---- Server-side streaming RPC ---------------------------------------- */
+
+int rpc_server_register_stream(rpc_server *s, uint32_t method,
+                               rpc_stream_mode mode, rpc_stream_handler fn,
+                               void *userdata)
+{
+    if (!s || !method || !fn || atomic_load(&s->running) ||
+        (mode != RPC_STREAM_SERVER && mode != RPC_STREAM_CLIENT))
+        return RPC_ERR_INVALID;
+    for (method_entry *e = s->methods; e; e = e->next)
+        if (e->method == method) return RPC_ERR_INVALID;
+    method_entry *e = calloc(1, sizeof(*e));
+    if (!e) return RPC_ERR_NOMEM;
+    e->method = method;
+    e->stream_fn = fn;
+    e->stream_mode = mode;
+    e->userdata = userdata;
+    e->next = s->methods;
+    s->methods = e;
+    return RPC_OK;
+}
+
+const void *rpc_stream_request_data(const rpc_stream *st)
+{
+    return st && st->server ? st->initial : NULL;
+}
+
+size_t rpc_stream_request_size(const rpc_stream *st)
+{
+    return st && st->server ? st->initial_len : 0;
+}
+
+static void stream_out_push(rpc_stream *st, stream_frame *f)
+{
+    if (st->out_tail) st->out_tail->next = f;
+    else st->out_head = f;
+    st->out_tail = f;
+    ++st->out_count;
+    st->out_bytes += f->len;
+}
+
+int rpc_stream_write(rpc_stream *st, const void *data, size_t len, int timeout_ms)
+{
+    if (!st || (len && !data) || len > RPC_MAX_PAYLOAD || timeout_ms <= 0)
+        return len > RPC_MAX_PAYLOAD ? RPC_ERR_LIMIT : RPC_ERR_INVALID;
+    if (st->client) return client_stream_write(st, data, len, timeout_ms);
+    if (st->mode != RPC_STREAM_SERVER && st->mode != RPC_STREAM_CLIENT)
+        return RPC_ERR_INVALID;
+
+    /* One application writer per stream; the frame is copied before return. */
+    stream_frame *f = frame_new(RPC_STREAM_DATA, st->id, st->method,
+                                0, data, len);
+    if (!f) return RPC_ERR_NOMEM;
+    int result = RPC_OK;
+    int64_t deadline = clock_ms() + timeout_ms;
+    pthread_mutex_lock(&st->lock);
+    if (st->mode == RPC_STREAM_CLIENT && st->response_messages)
+        result = RPC_ERR_INVALID;
+    while (result == RPC_OK && !st->failed && !st->local_finished &&
+           (st->out_count >= RPC_STREAM_QUEUE_MESSAGES ||
+            st->out_bytes + f->len > RPC_STREAM_QUEUE_BYTES)) {
+        result = stream_wait_until(st, deadline);
+    }
+    if (result == RPC_OK && (st->failed || st->local_finished))
+        result = st->failed ? RPC_ERR_CLOSED : RPC_ERR_INVALID;
+    if (result == RPC_OK) {
+        stream_out_push(st, f);
+        if (st->mode == RPC_STREAM_CLIENT) ++st->response_messages;
+        /* Notify while holding lock, preventing cleanup until notification. */
+        stream_wake(st->server);
+        f = NULL;
+    }
+    pthread_mutex_unlock(&st->lock);
+    frame_free(f);
+    return result;
+}
+
+int rpc_stream_finish(rpc_stream *st, uint32_t status)
+{
+    if (!st || !st->server) return RPC_ERR_INVALID;
+    /* Even after a disconnect, finish() is necessary to complete ownership. */
+    stream_frame *f = frame_new(RPC_STREAM_FINISH, st->id, st->method,
+                                status, NULL, 0);
+    if (!f) return RPC_ERR_NOMEM;
+    pthread_mutex_lock(&st->lock);
+    if (st->local_finished) {
+        pthread_mutex_unlock(&st->lock);
+        frame_free(f);
+        return RPC_ERR_INVALID;
+    }
+    st->local_finished = true;
+    if (!st->failed) {
+        stream_out_push(st, f); /* Control frame bypasses data queue limit. */
+        f = NULL;
+    }
+    pthread_cond_broadcast(&st->cond);
+    stream_wake(st->server);
+    pthread_mutex_unlock(&st->lock);
+    frame_free(f);
+    return RPC_OK;
+}
+
+int rpc_stream_read(rpc_stream *st, rpc_buf *message, int timeout_ms)
+{
+    if (!st || !message || timeout_ms <= 0) return RPC_ERR_INVALID;
+    if (st->client) return client_stream_read(st, message, timeout_ms);
+    if (st->mode != RPC_STREAM_CLIENT) return RPC_ERR_INVALID;
+    message->len = 0;
+    int rc = RPC_OK;
+    int64_t deadline = clock_ms() + timeout_ms;
+    pthread_mutex_lock(&st->lock);
+    while (!st->in_head && !st->remote_closed && !st->failed &&
+           !st->local_finished && rc == RPC_OK)
+        rc = stream_wait_until(st, deadline);
+    if (st->failed) rc = RPC_ERR_CLOSED;
+    else if (st->in_head) {
+        stream_frame *f = st->in_head;
+        if (message->cap < f->len) {
+            void *p = realloc(message->data, f->len);
+            if (!p && f->len) rc = RPC_ERR_NOMEM;
+            else { message->data = p; message->cap = f->len; }
+        }
+        if (rc == RPC_OK) {
+            if (f->len) memcpy(message->data, f->bytes, f->len);
+            message->len = f->len;
+            st->in_head = f->next;
+            if (!st->in_head) st->in_tail = NULL;
+            --st->in_count;
+            st->in_bytes -= f->len;
+            frame_free(f);
+            stream_wake(st->server); /* Resume EPOLLIN after queue frees up. */
+        }
+    } else if (st->remote_closed) rc = RPC_STREAM_EOF;
+    else if (st->local_finished) rc = RPC_ERR_INVALID;
+    pthread_mutex_unlock(&st->lock);
+    return rc;
+}
+
+static int stream_dispatch_open(rpc_conn *c)
+{
+    rpc_server *srv = c->server;
+    rpc_stream *st = calloc(1, sizeof(*st));
+    if (!st) return -1;
+    st->server = srv;
+    st->conn = c;
+    st->id = c->request_id;
+    st->method = c->method;
+    st->mode = (rpc_stream_mode)get32(c->header + 16);
+    st->initial = c->payload;
+    st->initial_len = c->payload_len;
+    st->remote_closed = st->mode == RPC_STREAM_SERVER;
+    c->payload = NULL;
+    c->payload_len = c->payload_read = c->header_read = 0;
+    if (stream_init_server(st) < 0) { free(st->initial); free(st); return -1; }
+    c->stream = st;
+    ++srv->pending_count;
+    method_entry *entry = NULL;
+    for (method_entry *e = srv->methods; e; e = e->next)
+        if (e->method == st->method) { entry = e; break; }
+    int rc = RPC_DONE;
+    if (entry && entry->stream_fn && entry->stream_mode == st->mode)
+        rc = entry->stream_fn(st, entry->userdata);
+    /* Workers may have written and finished while the handler was running. */
+    pthread_mutex_lock(&st->lock);
+    bool finished = st->local_finished;
+    st->handler_returned = true;
+    pthread_mutex_unlock(&st->lock);
+    if (!finished && rc != RPC_PENDING) {
+        uint32_t status = !entry ? RPC_STATUS_NO_METHOD :
+                      !entry->fn ? RPC_STATUS_HANDLER_ERROR :
+                          !entry->stream_fn || entry->stream_mode != st->mode ?
+                          RPC_STATUS_HANDLER_ERROR :
+                          rc == RPC_DONE ? RPC_STATUS_OK : RPC_STATUS_HANDLER_ERROR;
+        if (rpc_stream_finish(st, status) != RPC_OK) {
+            /* There is no worker to finish this call if completion-frame
+             * allocation fails. Mark it done before closing the connection. */
+            pthread_mutex_lock(&st->lock);
+            st->local_finished = true;
+            pthread_mutex_unlock(&st->lock);
+            return -1;
+        }
+    }
+    /* Do not dereference st after refresh; an early finish may be reaped. */
+    return server_stream_refresh(c);
+}
+
+/* The decoder owns c->payload. A DATA message hands it to the inbound queue. */
+static int stream_consume_frame(rpc_conn *c, uint16_t type)
+{
+    rpc_stream *st = c->stream;
+    if (!st) return -1;
+    if (type == RPC_STREAM_DATA) {
+        stream_frame *f = calloc(1, sizeof(*f));
+        if (!f) return -1;
+        f->bytes = c->payload;
+        f->len = c->payload_len;
+        c->payload = NULL;
+        pthread_mutex_lock(&st->lock);
+        if (st->failed || st->remote_closed || st->in_count >= RPC_STREAM_QUEUE_MESSAGES) {
+            pthread_mutex_unlock(&st->lock);
+            frame_free(f);
+            return -1;
+        }
+        if (st->in_tail) st->in_tail->next = f;
+        else st->in_head = f;
+        st->in_tail = f;
+        ++st->in_count;
+        st->in_bytes += f->len;
+        pthread_cond_signal(&st->cond);
+        pthread_mutex_unlock(&st->lock);
+    } else if (type == RPC_STREAM_HALF_CLOSE) {
+        pthread_mutex_lock(&st->lock);
+        if (st->remote_closed) {
+            pthread_mutex_unlock(&st->lock);
+            return -1;
+        }
+        st->remote_closed = true;
+        pthread_cond_broadcast(&st->cond);
+        pthread_mutex_unlock(&st->lock);
+    } else return -1;
+    c->payload_len = c->payload_read = c->header_read = 0;
+    return server_stream_refresh(c);
+}
+
+/* Called only by the Reactor: moves queued frames into the socket writer. */
+static int server_stream_refresh(rpc_conn *c)
+{
+    rpc_stream *st = c->stream;
+    if (!st || c->closed) return 0;
+    pthread_mutex_lock(&st->lock);
+    bool finished = st->local_finished && st->handler_returned &&
+                    st->out_count == 0;
+    bool remote_closed = st->remote_closed;
+    bool read_ready = st->in_count < RPC_STREAM_QUEUE_MESSAGES &&
+                      st->in_bytes < RPC_STREAM_QUEUE_BYTES;
+    if (!c->out && st->out_head) {
+        stream_frame *f = st->out_head;
+        st->out_head = f->next;
+        if (!st->out_head) st->out_tail = NULL;
+        c->out = f->bytes;
+        c->out_len = f->len;
+        c->out_written = 0;
+        f->bytes = NULL;
+        frame_free(f);
+    }
+    pthread_mutex_unlock(&st->lock);
+    if (finished) {
+        /* An early server-side error may leave unread request DATA frames. */
+        c->stream = NULL;
+        stream_free(st);
+        --c->server->pending_count;
+        if (!remote_closed) return -1;
+        return conn_events(c, EPOLLIN);
+    }
+    uint32_t events = 0;
+    if (!remote_closed && read_ready) events |= EPOLLIN;
+    if (c->out) events |= EPOLLOUT;
+    return conn_events(c, events);
+}
+
+static int stream_conn_write(rpc_conn *c)
+{
+    rpc_stream *st = c->stream;
+    size_t budget = 2u * RPC_MAX_PAYLOAD;
+    for (;;) {
+        if (!c->out) {
+            if (server_stream_refresh(c) < 0) return -1;
+            if (!c->stream || !c->out) return 0;
+        }
+        while (c->out_written < c->out_len) {
+            ssize_t n = send(c->fd, c->out + c->out_written,
+                             c->out_len - c->out_written, MSG_NOSIGNAL);
+            if (n > 0) c->out_written += (size_t)n;
+            else if (n < 0 && errno == EINTR) continue;
+            else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                return 0;
+            else return -1;
+        }
+        size_t consumed = c->out_len;
+        free(c->out);
+        c->out = NULL;
+        c->out_len = c->out_written = 0;
+        pthread_mutex_lock(&st->lock);
+        st->out_bytes -= consumed;
+        --st->out_count;
+        pthread_cond_broadcast(&st->cond);
+        pthread_mutex_unlock(&st->lock);
+        /* Yield after a bounded amount of output to avoid starving other
+         * connections under continuously generated stream data. */
+        if (consumed >= budget) return server_stream_refresh(c);
+        budget -= consumed;
+        /* The last frame may have been FINISH; refresh can retire st. */
+    }
 }
 
 /* Transfers ownership of frame to the connection. Reactor thread only. */
@@ -380,7 +819,7 @@ static int dispatch(rpc_conn *c)
             break;
         }
     }
-    int result = entry ? entry->fn(req, entry->userdata) : RPC_DONE;
+    int result = entry && entry->fn ? entry->fn(req, entry->userdata) : RPC_DONE;
     if (result == RPC_PENDING || atomic_load(&req->replied)) {
         /* The reply may already be queued before the handler has returned. */
         ++s->pending_count;
@@ -408,20 +847,42 @@ static int conn_read(rpc_conn *c)
             else if (errno == EINTR) continue;
             else return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
             if (c->header_read < RPC_HEADER_SIZE) continue;
+
             const uint8_t *h = c->header;
+            uint16_t type = get16(h + 6);
             if (get32(h) != RPC_MAGIC || get16(h + 4) != RPC_VERSION ||
-                get16(h + 6) != RPC_REQUEST || get32(h + 8) == 0 ||
-                get32(h + 12) == 0 || get32(h + 16) != 0)
+                get32(h + 8) == 0 || get32(h + 12) == 0 ||
+                get32(h + 20) > RPC_MAX_PAYLOAD)
                 return -1;
             c->request_id = get32(h + 8);
             c->method = get32(h + 12);
             c->payload_len = get32(h + 20);
-            if (c->payload_len > RPC_MAX_PAYLOAD) return -1;
+            if (c->stream) {
+                rpc_stream *st = c->stream;
+                if (st->id != c->request_id || st->method != c->method ||
+                    get32(h + 16) != 0 || st->mode != RPC_STREAM_CLIENT ||
+                    (type != RPC_STREAM_DATA && type != RPC_STREAM_HALF_CLOSE) ||
+                    (type == RPC_STREAM_HALF_CLOSE && c->payload_len != 0))
+                    return -1;
+                pthread_mutex_lock(&st->lock);
+                bool full = st->in_count >= RPC_STREAM_QUEUE_MESSAGES;
+                bool remote_closed = st->remote_closed;
+                pthread_mutex_unlock(&st->lock);
+                if (full || remote_closed) return -1;
+            } else if (type == RPC_REQUEST) {
+                if (get32(h + 16) != 0) return -1;
+            } else if (type == RPC_STREAM_OPEN) {
+                uint32_t mode = get32(h + 16);
+                if (mode != RPC_STREAM_SERVER && mode != RPC_STREAM_CLIENT)
+                    return -1;
+            } else return -1;
             if (c->payload_len) {
                 c->payload = malloc(c->payload_len);
                 if (!c->payload) return -1;
             } else {
-                return dispatch(c);
+                if (type == RPC_REQUEST) return dispatch(c);
+                if (type == RPC_STREAM_OPEN) return stream_dispatch_open(c);
+                return stream_consume_frame(c, type);
             }
         }
         ssize_t n = recv(c->fd, c->payload + c->payload_read,
@@ -430,7 +891,12 @@ static int conn_read(rpc_conn *c)
         else if (n == 0) return -1;
         else if (errno == EINTR) continue;
         else return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
-        if (c->payload_read == c->payload_len) return dispatch(c);
+        if (c->payload_read == c->payload_len) {
+            uint16_t type = get16(c->header + 6);
+            if (type == RPC_REQUEST) return dispatch(c);
+            if (type == RPC_STREAM_OPEN) return stream_dispatch_open(c);
+            return stream_consume_frame(c, type);
+        }
     }
 }
 
@@ -539,6 +1005,11 @@ int rpc_server_run(rpc_server *s)
             while (s->connections) close_conn(s, s->connections);
         }
         drain_completions(s, !shutting_down);
+        for (rpc_conn *c = s->connections; c;) {
+            rpc_conn *next = c->next;
+            if (c->stream && server_stream_refresh(c) < 0) close_conn(s, c);
+            c = next;
+        }
         reap_closed(s);
         if (shutting_down && s->pending_count == 0) break;
 
@@ -570,7 +1041,11 @@ int rpc_server_run(rpc_server *s)
                 uint32_t flags = events[i].events;
                 int rc = 0;
                 if (flags & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) rc = -1;
-                else if (c->out && (flags & EPOLLOUT)) rc = conn_write(c);
+                else if (c->stream) {
+                    if (flags & EPOLLOUT) rc = stream_conn_write(c);
+                    if (rc == 0 && c->stream && (flags & EPOLLIN))
+                        rc = conn_read(c);
+                } else if (c->out && (flags & EPOLLOUT)) rc = conn_write(c);
                 else if (!c->out && !c->active && (flags & EPOLLIN))
                     rc = conn_read(c);
                 if (rc < 0) close_conn(s, c);
@@ -618,6 +1093,7 @@ struct rpc_client {
     int fd;
     uint32_t next_id;
     uint32_t last_status;
+    bool busy;
 };
 
 static int64_t clock_ms(void)
@@ -705,10 +1181,151 @@ static int transfer(int fd, void *data, size_t len, int sending, int64_t deadlin
     return RPC_OK;
 }
 
+/* ---- Synchronous client-side streaming ------------------------------- */
+
+static int client_stream_break(rpc_stream *st, int rc)
+{
+    if (st->client->fd >= 0) {
+        close(st->client->fd);
+        st->client->fd = -1;
+    }
+    return rc;
+}
+
+int rpc_stream_open(rpc_client *c, uint32_t method, rpc_stream_mode mode,
+                    const void *initial, size_t initial_len,
+                    int timeout_ms, rpc_stream **out)
+{
+    if (!c || !out || !method || timeout_ms <= 0 || c->busy ||
+        (initial_len && !initial) ||
+        (mode != RPC_STREAM_SERVER && mode != RPC_STREAM_CLIENT))
+        return RPC_ERR_INVALID;
+    if (c->fd < 0) return RPC_ERR_CLOSED;
+    if (initial_len > RPC_MAX_PAYLOAD) return RPC_ERR_LIMIT;
+    *out = NULL;
+    rpc_stream *st = calloc(1, sizeof(*st));
+    if (!st) return RPC_ERR_NOMEM;
+    st->client = c;
+    st->mode = mode;
+    st->method = method;
+    st->id = ++c->next_id;
+    if (st->id == 0) st->id = ++c->next_id;
+    uint8_t header[RPC_HEADER_SIZE];
+    make_header(header, RPC_STREAM_OPEN, st->id, method, mode,
+                (uint32_t)initial_len);
+    int64_t deadline = clock_ms() + timeout_ms;
+    int rc = transfer(c->fd, header, sizeof(header), 1, deadline);
+    if (rc == RPC_OK && initial_len)
+        rc = transfer(c->fd, (void *)initial, initial_len, 1, deadline);
+    if (rc != RPC_OK) {
+        client_stream_break(st, rc);
+        free(st);
+        return rc;
+    }
+    c->busy = true;
+    *out = st;
+    return RPC_OK;
+}
+
+static int client_stream_write(rpc_stream *st, const void *data,
+                               size_t len, int timeout_ms)
+{
+    if (st->client->fd < 0) return RPC_ERR_CLOSED;
+    if (st->mode != RPC_STREAM_CLIENT || st->client_send_closed ||
+        st->client_final_received)
+        return RPC_ERR_INVALID;
+    uint8_t header[RPC_HEADER_SIZE];
+    make_header(header, RPC_STREAM_DATA, st->id, st->method, 0, (uint32_t)len);
+    int64_t deadline = clock_ms() + timeout_ms;
+    int rc = transfer(st->client->fd, header, sizeof(header), 1, deadline);
+    if (rc == RPC_OK && len)
+        rc = transfer(st->client->fd, (void *)data, len, 1, deadline);
+    return rc == RPC_OK ? RPC_OK : client_stream_break(st, rc);
+}
+
+int rpc_stream_finish_send(rpc_stream *st, int timeout_ms)
+{
+    if (!st || !st->client || st->mode != RPC_STREAM_CLIENT ||
+        st->client_send_closed || timeout_ms <= 0)
+        return RPC_ERR_INVALID;
+    if (st->client->fd < 0) return RPC_ERR_CLOSED;
+    uint8_t header[RPC_HEADER_SIZE];
+    make_header(header, RPC_STREAM_HALF_CLOSE, st->id, st->method, 0, 0);
+    int64_t deadline = clock_ms() + timeout_ms;
+    int rc = transfer(st->client->fd, header, sizeof(header), 1, deadline);
+    if (rc == RPC_OK) st->client_send_closed = true;
+    else client_stream_break(st, rc);
+    return rc;
+}
+
+static int client_stream_read(rpc_stream *st, rpc_buf *msg, int timeout_ms)
+{
+    rpc_client *c = st->client;
+    msg->len = 0;
+    if (c->fd < 0) return RPC_ERR_CLOSED;
+    if (st->client_final_received) return st->remote_status == RPC_STATUS_OK ?
+                                      RPC_STREAM_EOF : RPC_ERR_REMOTE;
+    if (st->mode == RPC_STREAM_CLIENT && !st->client_send_closed)
+        return RPC_ERR_INVALID;
+    msg->len = 0;
+    uint8_t header[RPC_HEADER_SIZE];
+    int64_t deadline = clock_ms() + timeout_ms;
+    int rc = transfer(c->fd, header, sizeof(header), 0, deadline);
+    if (rc != RPC_OK) return client_stream_break(st, rc);
+    uint16_t type = get16(header + 6);
+    uint32_t len = get32(header + 20);
+    if (get32(header) != RPC_MAGIC || get16(header + 4) != RPC_VERSION ||
+        get32(header + 8) != st->id || get32(header + 12) != st->method ||
+        len > RPC_MAX_PAYLOAD ||
+        (type != RPC_STREAM_DATA && type != RPC_STREAM_FINISH) ||
+        (type == RPC_STREAM_FINISH && len != 0) ||
+        (type == RPC_STREAM_DATA && get32(header + 16) != 0) ||
+        (type == RPC_STREAM_DATA && st->mode == RPC_STREAM_CLIENT &&
+         st->client_data_count))
+        return client_stream_break(st, RPC_ERR_PROTOCOL);
+    if (type == RPC_STREAM_FINISH) {
+        st->client_final_received = true;
+        st->remote_status = get32(header + 16);
+        c->last_status = st->remote_status;
+        return st->remote_status == RPC_STATUS_OK ? RPC_STREAM_EOF : RPC_ERR_REMOTE;
+    }
+    if (len > msg->cap) {
+        void *buf = realloc(msg->data, len);
+        if (!buf) return client_stream_break(st, RPC_ERR_NOMEM);
+        msg->data = buf;
+        msg->cap = len;
+    }
+    if (len) {
+        rc = transfer(c->fd, msg->data, len, 0, deadline);
+        if (rc != RPC_OK) return client_stream_break(st, rc);
+    }
+    msg->len = len;
+    ++st->client_data_count;
+    return RPC_OK;
+}
+
+uint32_t rpc_stream_remote_status(const rpc_stream *st)
+{
+    return st && st->client && st->client_final_received ? st->remote_status : 0;
+}
+
+void rpc_stream_destroy(rpc_stream *st)
+{
+    if (!st || !st->client) return;
+    rpc_client *c = st->client;
+    /* Unfinished calls cannot leave their frames on a reusable connection. */
+    if (!st->client_final_received && c->fd >= 0) {
+        close(c->fd);
+        c->fd = -1;
+    }
+    c->busy = false;
+    free(st);
+}
+
 int rpc_call(rpc_client *c, uint32_t method, const void *request,
              size_t request_len, rpc_buf *response, int timeout_ms)
 {
-    if (!c || !response || !method || timeout_ms <= 0 ||
+    if (!c || !response || !method || c->busy || timeout_ms <= 0 ||
         (request_len && !request)) return RPC_ERR_INVALID;
     if (request_len > RPC_MAX_PAYLOAD) return RPC_ERR_LIMIT;
     if (c->fd < 0) return RPC_ERR_CLOSED;

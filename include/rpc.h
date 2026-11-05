@@ -20,7 +20,8 @@ enum {
     RPC_ERR_REMOTE = -5,
     RPC_ERR_LIMIT = -6,
     RPC_ERR_INVALID = -7,
-    RPC_ERR_NOMEM = -8
+    RPC_ERR_NOMEM = -8,
+    RPC_STREAM_EOF = 1  /* successful end of message sequence */
 };
 
 enum {
@@ -71,6 +72,71 @@ int rpc_request_set_response(rpc_request *req, const void *data, size_t size);
  */
 int rpc_request_reply(rpc_request *req, uint32_t status,
                       const void *data, size_t size);
+
+/* Streaming RPC: one active call per TCP connection, no multiplexing.
+ * Frames carry complete messages (0..RPC_MAX_PAYLOAD), not raw TCP bytes.
+ * The total number of messages/bytes in a stream is not capped.
+ * These functions are not callable from the Reactor thread when they can wait.
+ * Use RPC_PENDING and a user-owned worker for streaming handlers.
+ */
+typedef struct rpc_stream rpc_stream;
+
+typedef enum rpc_stream_mode {
+    RPC_STREAM_SERVER = 1, /* one initial request; many response messages */
+    RPC_STREAM_CLIENT = 2  /* one initial request + many request messages; one response */
+} rpc_stream_mode;
+
+typedef int (*rpc_stream_handler)(rpc_stream *stream, void *userdata);
+
+/* Register only before run; method IDs are shared with Unary handlers. */
+int rpc_server_register_stream(rpc_server *server, uint32_t method,
+                               rpc_stream_mode mode,
+                               rpc_stream_handler handler, void *userdata);
+
+/* Initiate a streaming method from a client. The initial request is copied
+ * into the opening frame; timeout applies to opening frame transfer.
+ * The rpc_client is exclusive until rpc_stream_destroy().
+ */
+int rpc_stream_open(rpc_client *client, uint32_t method,
+                    rpc_stream_mode mode, const void *initial_request,
+                    size_t initial_len, int timeout_ms, rpc_stream **out);
+
+/* Write/read ONE complete message. Each operation has its own deadline.
+ * Server write is safe from a worker thread and uses bounded queuing; when
+ * full, it waits for the Reactor to send bytes. Server read waits for data.
+ * Exactly one business thread may operate on a stream at any time; do not
+ * call read/write/finish concurrently on the same stream. Never block the
+ * Reactor thread inside a streaming Handler.
+ * Client write/read use nonblocking sockets with poll internally.
+ * read(): RPC_STREAM_EOF means a successful remote finish (or request-side
+ * half-close when called by a server); RPC_ERR_REMOTE means final failure.
+ * Zero-length messages are legal and returned as RPC_OK with len == 0.
+ */
+int rpc_stream_write(rpc_stream *stream, const void *data,
+                     size_t len, int timeout_ms);
+int rpc_stream_read(rpc_stream *stream, rpc_buf *message, int timeout_ms);
+
+/* Client Streaming only: half-close request direction, then read response. */
+int rpc_stream_finish_send(rpc_stream *stream, int timeout_ms);
+
+/* Server only: complete the RPC, including the final remote status. A
+ * successful call hands the stream back to the framework; do not touch it
+ * afterward. Even a disconnected stream MUST be finished by user workers.
+ * A handler may finish before returning RPC_PENDING.
+ */
+int rpc_stream_finish(rpc_stream *stream, uint32_t status);
+
+/* Only meaningful after rpc_stream_read() returns STREAM_EOF or REMOTE. */
+uint32_t rpc_stream_remote_status(const rpc_stream *stream);
+
+/* Only on the client. An unfinished stream is cancelled by closing its
+ * connection; a completed stream can be followed by another call.
+ */
+void rpc_stream_destroy(rpc_stream *stream);
+
+/* Server-side initial request remains valid until successful finish(). */
+const void *rpc_stream_request_data(const rpc_stream *stream);
+size_t rpc_stream_request_size(const rpc_stream *stream);
 
 int rpc_buf_append(rpc_buf *buf, const void *data, size_t len);
 void rpc_buf_free(rpc_buf *buf);
