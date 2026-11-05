@@ -16,6 +16,17 @@
 - **背压**：服务端每条流最多缓存 **2 条待发送消息**（包含当前正在 Socket 上发送的消息）；接收侧最多排队 2 条消息，额外允许一条正在解析的消息。队列满时 Worker 等待、Reactor 适时暂停读。背压不会阻塞 Reactor。
 - **异步生命周期**：业务不需要引用计数。异步 Handler 返回 `RPC_PENDING` 后，必须最终执行成功的 `reply()` 或 `stream_finish()`，即使客户端已断开。服务端停止等待未完成业务；业务忘记完成会造成无限等待。
 
+## 源码模块
+
+代码已由原先的单文件 `src/rpc.c` 拆分：
+
+- `protocol.c`、`buffer.c`、`io.c`：网络协议、消息缓冲和公共 IO 工具。
+- `server.c`、`connection.c`、`request.c`、`server_stream.c`：服务端 Reactor、连接、Unary 请求和流式收发。
+- `client.c`、`client_stream.c`：同步 Unary 和流式客户端。
+- `src/rpc_internal.h`：仅供 `src/` 使用的内部结构及跨模块函数；业务代码仍只需 `include/rpc.h`。
+
+详见 [内部架构说明](docs/architecture.md)。此轮重构不改变对外 API、协议或线程模型。
+
 ## 编译和测试
 
 要求 Linux、C11 编译器、CMake >= 3.16、pthread。

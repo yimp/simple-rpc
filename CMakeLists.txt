@@ -3,7 +3,18 @@ project(simple_rpc VERSION 0.3.0 LANGUAGES C)
 
 find_package(Threads REQUIRED)
 
-add_library(simple_rpc STATIC src/rpc.c)
+add_library(simple_rpc STATIC
+    src/rpc_internal.h
+    src/buffer.c
+    src/protocol.c
+    src/io.c
+    src/request.c
+    src/connection.c
+    src/server_stream.c
+    src/server.c
+    src/client.c
+    src/client_stream.c
+)
 target_link_libraries(simple_rpc PUBLIC Threads::Threads)
 target_include_directories(simple_rpc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(simple_rpc PUBLIC c_std_11)
