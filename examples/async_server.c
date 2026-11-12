@@ -1,5 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
-#include "rpc.h"
+#include "rpc_server.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -39,7 +39,7 @@ static void *work(void *context)
 
         struct timespec delay = {.tv_sec = 0, .tv_nsec = 20000000};
         nanosleep(&delay, NULL); /* Simulated blocking business operation. */
-        int rc = rpc_request_reply(item->req, RPC_STATUS_OK,
+        int rc = rpc_request_complete(item->req, RPC_STATUS_OK,
                                    rpc_request_data(item->req),
                                    rpc_request_size(item->req));
         if (rc != RPC_OK) {
@@ -79,7 +79,11 @@ int main(void)
     }
 
     rpc_server *server = rpc_server_create();
-    if (!server || rpc_server_register(server, 1, async_echo, &pool) != RPC_OK ||
+    const rpc_method_desc method = {
+        .method = 1, .type = RPC_METHOD_UNARY,
+        .handler = async_echo, .userdata = &pool
+    };
+    if (!server || rpc_server_register(server, &method) != RPC_OK ||
         rpc_server_listen(server, "127.0.0.1", 9001) != RPC_OK) {
         fprintf(stderr, "failed to initialize server\n");
         rpc_server_destroy(server);

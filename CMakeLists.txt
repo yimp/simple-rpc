@@ -4,6 +4,10 @@ project(simple_rpc VERSION 0.3.0 LANGUAGES C)
 find_package(Threads REQUIRED)
 
 add_library(simple_rpc STATIC
+    include/rpc_common.h
+    include/rpc_client.h
+    include/rpc_server.h
+    include/rpc.h
     src/rpc_internal.h
     src/buffer.c
     src/protocol.c

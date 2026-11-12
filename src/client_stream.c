@@ -16,13 +16,13 @@ static int client_stream_break(rpc_stream *st, int rc)
     return rc;
 }
 
-int rpc_stream_open(rpc_client *c, uint32_t method, rpc_stream_mode mode,
+int rpc_stream_open(rpc_client *c, uint32_t method, rpc_method_type mode,
                     const void *initial, size_t initial_len,
                     int timeout_ms, rpc_stream **out)
 {
     if (!c || !out || !method || timeout_ms <= 0 || c->busy ||
         (initial_len && !initial) ||
-        (mode != RPC_STREAM_SERVER && mode != RPC_STREAM_CLIENT))
+        (mode != RPC_METHOD_SERVER_STREAM && mode != RPC_METHOD_CLIENT_STREAM))
         return RPC_ERR_INVALID;
     if (c->fd < 0) return RPC_ERR_CLOSED;
     if (initial_len > RPC_MAX_PAYLOAD) return RPC_ERR_LIMIT;
@@ -51,11 +51,20 @@ int rpc_stream_open(rpc_client *c, uint32_t method, rpc_stream_mode mode,
     return RPC_OK;
 }
 
+int rpc_stream_write(rpc_stream *st, const void *data,
+                     size_t len, int timeout_ms)
+{
+    if (!st || !st->client || (len && !data) || timeout_ms <= 0)
+        return RPC_ERR_INVALID;
+    if (len > RPC_MAX_PAYLOAD) return RPC_ERR_LIMIT;
+    return srpc_client_stream_write(st, data, len, timeout_ms);
+}
+
 int srpc_client_stream_write(rpc_stream *st, const void *data,
-                               size_t len, int timeout_ms)
+                             size_t len, int timeout_ms)
 {
     if (st->client->fd < 0) return RPC_ERR_CLOSED;
-    if (st->mode != RPC_STREAM_CLIENT || st->client_send_closed ||
+    if (st->mode != RPC_METHOD_CLIENT_STREAM || st->client_send_closed ||
         st->client_final_received)
         return RPC_ERR_INVALID;
     uint8_t header[RPC_HEADER_SIZE];
@@ -69,7 +78,7 @@ int srpc_client_stream_write(rpc_stream *st, const void *data,
 
 int rpc_stream_finish_send(rpc_stream *st, int timeout_ms)
 {
-    if (!st || !st->client || st->mode != RPC_STREAM_CLIENT ||
+    if (!st || !st->client || st->mode != RPC_METHOD_CLIENT_STREAM ||
         st->client_send_closed || timeout_ms <= 0)
         return RPC_ERR_INVALID;
     if (st->client->fd < 0) return RPC_ERR_CLOSED;
@@ -82,6 +91,13 @@ int rpc_stream_finish_send(rpc_stream *st, int timeout_ms)
     return rc;
 }
 
+int rpc_stream_read(rpc_stream *st, rpc_buf *msg, int timeout_ms)
+{
+    if (!st || !st->client || !msg || timeout_ms <= 0)
+        return RPC_ERR_INVALID;
+    return srpc_client_stream_read(st, msg, timeout_ms);
+}
+
 int srpc_client_stream_read(rpc_stream *st, rpc_buf *msg, int timeout_ms)
 {
     rpc_client *c = st->client;
@@ -89,7 +105,7 @@ int srpc_client_stream_read(rpc_stream *st, rpc_buf *msg, int timeout_ms)
     if (c->fd < 0) return RPC_ERR_CLOSED;
     if (st->client_final_received) return st->remote_status == RPC_STATUS_OK ?
                                       RPC_STREAM_EOF : RPC_ERR_REMOTE;
-    if (st->mode == RPC_STREAM_CLIENT && !st->client_send_closed)
+    if (st->mode == RPC_METHOD_CLIENT_STREAM && !st->client_send_closed)
         return RPC_ERR_INVALID;
     msg->len = 0;
     uint8_t header[RPC_HEADER_SIZE];
@@ -104,7 +120,7 @@ int srpc_client_stream_read(rpc_stream *st, rpc_buf *msg, int timeout_ms)
         (type != RPC_STREAM_DATA && type != RPC_STREAM_FINISH) ||
         (type == RPC_STREAM_FINISH && len != 0) ||
         (type == RPC_STREAM_DATA && srpc_get32(header + 16) != 0) ||
-        (type == RPC_STREAM_DATA && st->mode == RPC_STREAM_CLIENT &&
+        (type == RPC_STREAM_DATA && st->mode == RPC_METHOD_CLIENT_STREAM &&
          st->client_data_count))
         return client_stream_break(st, RPC_ERR_PROTOCOL);
     if (type == RPC_STREAM_FINISH) {

@@ -34,17 +34,22 @@ rpc_server *rpc_server_create(void)
     return s;
 }
 
-int rpc_server_register(rpc_server *s, uint32_t method,
-                        rpc_handler fn, void *userdata)
+int rpc_server_register(rpc_server *s, const rpc_method_desc *desc)
 {
-    if (!s || !method || !fn || atomic_load(&s->running))
+    if (!s || !desc || !desc->method || !desc->handler ||
+        atomic_load(&s->running))
+        return RPC_ERR_INVALID;
+    if (desc->type != RPC_METHOD_UNARY &&
+        desc->type != RPC_METHOD_SERVER_STREAM &&
+        desc->type != RPC_METHOD_CLIENT_STREAM)
         return RPC_ERR_INVALID;
     for (method_entry *e = s->methods; e; e = e->next)
-        if (e->method == method) return RPC_ERR_INVALID;
+        if (e->method == desc->method) return RPC_ERR_INVALID;
     method_entry *e = malloc(sizeof(*e));
     if (!e) return RPC_ERR_NOMEM;
-    *e = (method_entry){.method = method, .fn = fn,
-                        .userdata = userdata, .next = s->methods};
+    *e = (method_entry){.method=desc->method, .type=desc->type,
+                        .fn=desc->handler, .userdata=desc->userdata,
+                        .next=s->methods};
     s->methods = e;
     return RPC_OK;
 }
@@ -80,27 +85,7 @@ uint16_t rpc_server_port(const rpc_server *s)
     return s ? s->port : 0;
 }
 
-int rpc_server_register_stream(rpc_server *s, uint32_t method,
-                               rpc_stream_mode mode, rpc_stream_handler fn,
-                               void *userdata)
-{
-    if (!s || !method || !fn || atomic_load(&s->running) ||
-        (mode != RPC_STREAM_SERVER && mode != RPC_STREAM_CLIENT))
-        return RPC_ERR_INVALID;
-    for (method_entry *e = s->methods; e; e = e->next)
-        if (e->method == method) return RPC_ERR_INVALID;
-    method_entry *e = calloc(1, sizeof(*e));
-    if (!e) return RPC_ERR_NOMEM;
-    e->method = method;
-    e->stream_fn = fn;
-    e->stream_mode = mode;
-    e->userdata = userdata;
-    e->next = s->methods;
-    s->methods = e;
-    return RPC_OK;
-}
-
-static int accept_clients(rpc_server *s)
+src/server.cstatic int accept_clients(rpc_server *s)
 {
     for (;;) {
         int fd = accept(s->listen_fd, NULL, NULL);

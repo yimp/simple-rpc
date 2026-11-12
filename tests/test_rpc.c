@@ -40,7 +40,7 @@ static int echo(rpc_request *req, void *user)
     assert(rpc_request_method(req) == 1);
     return rpc_request_set_response(req, rpc_request_data(req),
                                     rpc_request_size(req)) == RPC_OK
-               ? RPC_DONE : RPC_ERR_NOMEM;
+               ? RPC_HANDLER_DONE : RPC_ERR_NOMEM;
 }
 
 static int fail_handler(rpc_request *req, void *user)
@@ -55,7 +55,7 @@ static int slow_handler(rpc_request *req, void *user)
     (void)req;
     (void)user;
     delay_ms(150);
-    return RPC_DONE;
+    return RPC_HANDLER_DONE;
 }
 
 static void *worker(void *arg)
@@ -79,7 +79,7 @@ static void *worker(void *arg)
          * returned or the client disconnected. No explicit retain needed. */
         const void *data = rpc_request_data(t->req);
         size_t len = rpc_request_size(t->req);
-        assert(rpc_request_reply(t->req, RPC_STATUS_OK, data, len) == RPC_OK);
+        assert(rpc_request_complete(t->req, RPC_STATUS_OK, data, len) == RPC_OK);
         /* t->req is invalid after the successful reply. */
         atomic_fetch_add(&p->completed, 1);
         free(t);
@@ -137,7 +137,7 @@ typedef struct {
 static void *early_worker(void *arg)
 {
     early_job *job = arg;
-    job->rc = rpc_request_reply(job->req, RPC_STATUS_OK,
+    job->rc = rpc_request_complete(job->req, RPC_STATUS_OK,
                                 rpc_request_data(job->req),
                                 rpc_request_size(job->req));
     return NULL;
@@ -157,7 +157,7 @@ static int early_reply(rpc_request *req, void *userdata)
 static int inline_reply(rpc_request *req, void *userdata)
 {
     (void)userdata;
-    int rc = rpc_request_reply(req, RPC_STATUS_OK,
+    int rc = rpc_request_complete(req, RPC_STATUS_OK,
                                rpc_request_data(req), rpc_request_size(req));
     return rc == RPC_OK ? RPC_PENDING : rc;
 }
@@ -194,6 +194,18 @@ static void *concurrent_client(void *arg)
     return NULL;
 }
 
+
+static int register_method(rpc_server *server, uint32_t method,
+                           rpc_method_type type, rpc_handler handler,
+                           void *userdata)
+{
+    const rpc_method_desc desc = {
+        .method = method, .type = type,
+        .handler = handler, .userdata = userdata
+    };
+    return rpc_server_register(server, &desc);
+}
+
 int main(void)
 {
     rpc_buf scratch = {0};
@@ -206,15 +218,15 @@ int main(void)
     pool_init(&pool);
     rpc_server *s = rpc_server_create();
     assert(s);
-    assert(rpc_server_register(s, 0, echo, NULL) == RPC_ERR_INVALID);
-    assert(rpc_server_register(s, 1, echo, NULL) == RPC_OK);
-    assert(rpc_server_register(s, 1, echo, NULL) == RPC_ERR_INVALID);
-    assert(rpc_server_register(s, 2, fail_handler, NULL) == RPC_OK);
-    assert(rpc_server_register(s, 3, slow_handler, NULL) == RPC_OK);
-    assert(rpc_server_register(s, 4, async_echo, &pool) == RPC_OK);
-    assert(rpc_server_register(s, 5, async_echo, &pool) == RPC_OK);
-    assert(rpc_server_register(s, 6, early_reply, NULL) == RPC_OK);
-    assert(rpc_server_register(s, 7, inline_reply, NULL) == RPC_OK);
+    assert(register_method(s, 0, RPC_METHOD_UNARY, echo, NULL) == RPC_ERR_INVALID);
+    assert(register_method(s, 1, RPC_METHOD_UNARY, echo, NULL) == RPC_OK);
+    assert(register_method(s, 1, RPC_METHOD_UNARY, echo, NULL) == RPC_ERR_INVALID);
+    assert(register_method(s, 2, RPC_METHOD_UNARY, fail_handler, NULL) == RPC_OK);
+    assert(register_method(s, 3, RPC_METHOD_UNARY, slow_handler, NULL) == RPC_OK);
+    assert(register_method(s, 4, RPC_METHOD_UNARY, async_echo, &pool) == RPC_OK);
+    assert(register_method(s, 5, RPC_METHOD_UNARY, async_echo, &pool) == RPC_OK);
+    assert(register_method(s, 6, RPC_METHOD_UNARY, early_reply, NULL) == RPC_OK);
+    assert(register_method(s, 7, RPC_METHOD_UNARY, inline_reply, NULL) == RPC_OK);
     assert(rpc_server_listen(s, "127.0.0.1", 0) == RPC_OK);
     uint16_t port = rpc_server_port(s);
     assert(port != 0);

@@ -41,7 +41,9 @@ void srpc_reap_closed(rpc_server *s)
             pthread_mutex_unlock(&st->lock);
             if (!done) { pp = &c->next; continue; }
             c->stream = NULL;
-            srpc_stream_free(st);
+            rpc_request *req = st->owner;
+            if (c->active == req) c->active = NULL;
+            srpc_free_request(req);
             --s->pending_count;
         }
         *pp = c->next;
@@ -87,7 +89,7 @@ int srpc_conn_read(rpc_conn *c)
             if (c->stream) {
                 rpc_stream *st = c->stream;
                 if (st->id != c->request_id || st->method != c->method ||
-                    srpc_get32(h + 16) != 0 || st->mode != RPC_STREAM_CLIENT ||
+                    srpc_get32(h + 16) != 0 || st->mode != RPC_METHOD_CLIENT_STREAM ||
                     (type != RPC_STREAM_DATA && type != RPC_STREAM_HALF_CLOSE) ||
                     (type == RPC_STREAM_HALF_CLOSE && c->payload_len != 0))
                     return -1;
@@ -100,7 +102,7 @@ int srpc_conn_read(rpc_conn *c)
                 if (srpc_get32(h + 16) != 0) return -1;
             } else if (type == RPC_STREAM_OPEN) {
                 uint32_t mode = srpc_get32(h + 16);
-                if (mode != RPC_STREAM_SERVER && mode != RPC_STREAM_CLIENT)
+                if (mode != RPC_METHOD_SERVER_STREAM && mode != RPC_METHOD_CLIENT_STREAM)
                     return -1;
             } else return -1;
             if (c->payload_len) {

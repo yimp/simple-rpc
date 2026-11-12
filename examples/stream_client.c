@@ -1,4 +1,4 @@
-#include "rpc.h"
+#include "rpc_client.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -14,7 +14,7 @@ int main(void)
     if (!c) { perror("connect"); return 1; }
     rpc_stream *s = NULL;
     uint64_t want = 3u * 1024u * 1024u;
-    if (rpc_stream_open(c, METHOD_DOWNLOAD, RPC_STREAM_SERVER,
+    if (rpc_stream_open(c, METHOD_DOWNLOAD, RPC_METHOD_SERVER_STREAM,
                         &want, sizeof(want), 5000, &s) != RPC_OK)
         return 1;
     rpc_buf msg = {0};
@@ -30,7 +30,7 @@ int main(void)
     rpc_stream_destroy(s);
     printf("download: %llu bytes\n", (unsigned long long)received);
 
-    if (rpc_stream_open(c, METHOD_UPLOAD, RPC_STREAM_CLIENT,
+    if (rpc_stream_open(c, METHOD_UPLOAD, RPC_METHOD_CLIENT_STREAM,
                         NULL, 0, 5000, &s) != RPC_OK)
         return 1;
     char chunk[65536];
