@@ -85,7 +85,7 @@ uint16_t rpc_server_port(const rpc_server *s)
     return s ? s->port : 0;
 }
 
-src/server.cstatic int accept_clients(rpc_server *s)
+static int accept_clients(rpc_server *s)
 {
     for (;;) {
         int fd = accept(s->listen_fd, NULL, NULL);
